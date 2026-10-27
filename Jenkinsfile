@@ -19,6 +19,7 @@ pipeline {
         stage('Checkout') {
             steps {
                 checkout scm
+
                 sh '''
                     echo "===== SkillBridge checkout ====="
                     git rev-parse --short HEAD
@@ -26,6 +27,7 @@ pipeline {
                     test -f backend/Dockerfile
                     test -f frontend/Dockerfile
                     test -f docker-compose.yml
+                    test -f Jenkinsfile
                 '''
             }
         }
@@ -33,7 +35,15 @@ pipeline {
         stage('Backend Validation') {
             steps {
                 sh '''
-                    python3 -m compileall -q backend
+                    echo "===== Build backend validation image ====="
+                    docker build -t skillbridge-backend-ci ./backend
+
+                    echo "===== Validate Python syntax ====="
+                    docker run --rm \
+                      --entrypoint python \
+                      skillbridge-backend-ci \
+                      -m compileall -q /app
+
                     echo "Backend Python syntax validation passed."
                 '''
             }
@@ -41,24 +51,68 @@ pipeline {
 
         stage('Frontend Build Test') {
             steps {
-                dir('frontend') {
-                    sh '''
-                        npm ci
-                        npm run build
-                    '''
-                }
+                sh '''
+                    echo "===== Build frontend ====="
+                    docker build \
+                      --target build \
+                      -t skillbridge-frontend-ci \
+                      ./frontend
+
+                    echo "Frontend build passed."
+                '''
             }
         }
 
         stage('Docker Compose Validation') {
             steps {
-                sh 'docker compose config -q'
+                withCredentials([
+                    usernamePassword(
+                        credentialsId: 'skillbridge-mysql-root',
+                        usernameVariable: 'MYSQL_ROOT_USERNAME',
+                        passwordVariable: 'MYSQL_ROOT_PASSWORD'
+                    ),
+                    usernamePassword(
+                        credentialsId: 'skillbridge-mysql-app',
+                        usernameVariable: 'MYSQL_USER',
+                        passwordVariable: 'MYSQL_PASSWORD'
+                    ),
+                    string(
+                        credentialsId: 'skillbridge-jwt-secret',
+                        variable: 'SECRET_KEY'
+                    )
+                ]) {
+                    sh '''
+                        set +x
+                        docker compose config -q
+                        echo "Docker Compose configuration is valid."
+                    '''
+                }
             }
         }
 
         stage('Build Docker Images') {
             steps {
-                sh 'docker compose build'
+                withCredentials([
+                    usernamePassword(
+                        credentialsId: 'skillbridge-mysql-root',
+                        usernameVariable: 'MYSQL_ROOT_USERNAME',
+                        passwordVariable: 'MYSQL_ROOT_PASSWORD'
+                    ),
+                    usernamePassword(
+                        credentialsId: 'skillbridge-mysql-app',
+                        usernameVariable: 'MYSQL_USER',
+                        passwordVariable: 'MYSQL_PASSWORD'
+                    ),
+                    string(
+                        credentialsId: 'skillbridge-jwt-secret',
+                        variable: 'SECRET_KEY'
+                    )
+                ]) {
+                    sh '''
+                        set +x
+                        docker compose build
+                    '''
+                }
             }
         }
 
@@ -82,7 +136,6 @@ pipeline {
                 ]) {
                     sh '''
                         set +x
-                        docker compose config -q
                         docker compose up -d --remove-orphans
                         docker compose ps
                     '''
@@ -93,31 +146,40 @@ pipeline {
         stage('Deployment Verification') {
             steps {
                 sh '''
-                    python3 - <<'PY'
-import time
-import urllib.request
+                    set -eu
 
-targets = {
-    "Frontend": "http://host.docker.internal:3018/",
-    "Backend": "http://host.docker.internal:8018/",
-    "API docs": "http://host.docker.internal:8018/docs",
-}
+                    echo "===== Verify SkillBridge endpoints ====="
 
-for name, url in targets.items():
-    for attempt in range(30):
-        try:
-            with urllib.request.urlopen(url, timeout=5) as response:
-                if response.status < 200 or response.status >= 400:
-                    raise RuntimeError(
-                        f"{name} returned HTTP {response.status}"
-                    )
-                print(f"{name}: HTTP {response.status} - {url}")
-                break
-        except Exception:
-            if attempt == 29:
-                raise
-            time.sleep(5)
-PY
+                    docker run --rm \
+                      --entrypoint sh \
+                      curlimages/curl:8.12.1 \
+                      -c '
+                        set -eu
+
+                        check_url() {
+                            name="$1"
+                            url="$2"
+                            attempt=1
+
+                            while [ "$attempt" -le 30 ]; do
+                                if curl -fsS --max-time 5 "$url" -o /dev/null; then
+                                    echo "$name is responding: $url"
+                                    return 0
+                                fi
+
+                                echo "Waiting for $name ($attempt/30)..."
+                                attempt=$((attempt + 1))
+                                sleep 5
+                            done
+
+                            echo "ERROR: $name did not respond: $url"
+                            return 1
+                        }
+
+                        check_url Frontend http://host.docker.internal:3018/
+                        check_url Backend http://host.docker.internal:8018/
+                        check_url API-docs http://host.docker.internal:8018/docs
+                      '
                 '''
             }
         }
@@ -125,13 +187,24 @@ PY
 
     post {
         success {
-            echo 'SkillBridge deployment completed successfully.'
+            echo 'SkillBridge pipeline completed successfully.'
+
+            echo 'Frontend: http://localhost:3018'
+            echo 'Backend:  http://localhost:8018'
+            echo 'API docs: http://localhost:8018/docs'
         }
+
         failure {
-            echo 'SkillBridge pipeline failed. Check the stage logs.'
-            sh 'docker compose ps || true'
-            sh 'docker compose logs --tail=80 backend mysql frontend || true'
+            echo 'SkillBridge pipeline failed. Inspect the failed stage.'
+
+            sh '''
+                docker ps -a --filter "name=skillbridge" || true
+                docker logs --tail 80 skillbridge-backend-1 || true
+                docker logs --tail 80 skillbridge-frontend-1 || true
+                docker logs --tail 80 skillbridge-mysql-1 || true
+            '''
         }
+
         always {
             echo 'SkillBridge pipeline finished.'
         }
