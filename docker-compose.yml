@@ -1,0 +1,68 @@
+
+name: skillbridge
+
+services:
+  mysql:
+    image: mysql:8.4
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?Set MYSQL_ROOT_PASSWORD in .env}
+      MYSQL_DATABASE: skillbridge
+      MYSQL_USER: ${MYSQL_USER:?Set MYSQL_USER in .env}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:?Set MYSQL_PASSWORD in .env}
+    volumes:
+      - skillbridge_mysql_data:/var/lib/mysql
+    networks:
+      - skillbridge-network
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-p${MYSQL_ROOT_PASSWORD}"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+  backend:
+    build:
+      context: ./backend
+    image: skillbridge-backend:latest
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: mysql+pymysql://${MYSQL_USER}:${MYSQL_PASSWORD}@mysql:3306/skillbridge
+      SECRET_KEY: ${SECRET_KEY:?Set SECRET_KEY in .env}
+    ports:
+      - "8018:8000"
+    depends_on:
+      mysql:
+        condition: service_healthy
+    networks:
+      - skillbridge-network
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://localhost:8000/').read()"
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  frontend:
+    build:
+      context: ./frontend
+    image: skillbridge-frontend:latest
+    restart: unless-stopped
+    ports:
+      - "3018:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks:
+      - skillbridge-network
+
+networks:
+  skillbridge-network:
+    driver: bridge
+
+volumes:
+  skillbridge_mysql_data:
